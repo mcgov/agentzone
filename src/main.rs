@@ -10,6 +10,8 @@ mod pcap;
 mod proxy;
 mod sandbox;
 mod tracer;
+mod watch;
+mod ws;
 
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -148,6 +150,20 @@ struct RunArgs {
     /// any link to it). Repeatable.
     #[arg(long, value_name = "NAME|PATH")]
     deny: Vec<String>,
+    /// Always log reads of this path (absolute, as seen in the sandbox; a
+    /// directory covers everything below it) or of any file with this bare
+    /// name. Adds to the built-in credential list (~/.ssh, ~/.aws,
+    /// ~/.config/gh, .env, ...). Repeatable.
+    #[arg(long, value_name = "PATH|NAME")]
+    watch_read: Vec<String>,
+    /// Don't watch the built-in credential paths (only --watch-read ones).
+    #[arg(long)]
+    no_default_watch: bool,
+    /// Leave io_uring available to the agent. By default io_uring_setup
+    /// fails with ENOSYS, because io_uring I/O bypasses the syscall hooks
+    /// and would go unlogged.
+    #[arg(long)]
+    allow_io_uring: bool,
     /// Command to run.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -242,6 +258,11 @@ fn run(a: RunArgs) -> Result<i32> {
         eprintln!("agentbox: deny {n}");
     }
 
+    let mut watch = if a.no_default_watch { watch::Watch::default() } else { watch::Watch::defaults(&home_at) };
+    for w in &a.watch_read {
+        watch.add(w).map_err(anyhow::Error::msg)?;
+    }
+
     let cfg = Config {
         project,
         mount_at,
@@ -256,6 +277,7 @@ fn run(a: RunArgs) -> Result<i32> {
         home_at,
         proxy: a.log_http,
         trust_dir: a.log_http.then(|| state.join("proxy")),
+        block_io_uring: !a.allow_io_uring,
     };
     sandbox::prepare_state(&cfg)?;
     let state = fs::canonicalize(&state)?;
@@ -290,7 +312,8 @@ fn run(a: RunArgs) -> Result<i32> {
     let log_path = a.log.unwrap_or_else(|| state.join("exec.jsonl"));
     let log_file = fs::File::create(&log_path)
         .with_context(|| format!("creating log {}", log_path.display()))?;
-    let logger = log::Logger::new(BufWriter::new(log_file), a.capture_env);
+    let mut logger = log::Logger::new(BufWriter::new(log_file), a.capture_env);
+    logger.watch = watch.clone();
 
     eprintln!("agentbox: state {}", state.display());
     eprintln!("agentbox: log   {}", log_path.display());
@@ -301,6 +324,7 @@ fn run(a: RunArgs) -> Result<i32> {
         capture_env: a.capture_env.is_some(),
         log_reads: a.log_reads,
         deny: &deny,
+        watch: &watch,
     };
     let opts = a.http.opts();
     let pcap = a.http.pcap(&state.join("http.pcap"))?;

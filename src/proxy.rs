@@ -354,6 +354,8 @@ async fn handle(id: u64, mut client: TcpStream, peer: SocketAddr, ctx: &Arc<Ctx>
     let (buf, head_len, head) = read_head(&mut client).await?;
 
     let mut tun = record("http_tunnel", id);
+    // The agent's source port: `local_port` on its kernel `connect` record.
+    tun.insert("client_port".into(), json!(peer.port()));
     if let Some(w) = &who {
         tun.extend(w.clone());
     }
@@ -484,6 +486,17 @@ struct Conv {
     errors: u32,
     /// --http-pcap: this connection as a synthesized TCP stream.
     flow: Option<crate::pcap::Flow>,
+    /// A 101 just switched this connection to WebSocket.
+    upgrade: Option<Upgrade>,
+    /// WebSocket frame parsers (client->server, server->client) and the URL.
+    ws: Option<(crate::ws::Dir, crate::ws::Dir, String)>,
+}
+
+struct Upgrade {
+    url: String,
+    deflate: bool,
+    client_no_takeover: bool,
+    server_no_takeover: bool,
 }
 
 impl Conv {
@@ -491,14 +504,86 @@ impl Conv {
         if let Some(f) = &mut self.flow {
             f.data(!response, d);
         }
+        if self.ws.is_some() {
+            return self.feed_ws(response, d);
+        }
         if response {
             let mut p = std::mem::replace(&mut self.resp_p, Parser::new(true));
             p.feed(d, &mut RespSink(self));
             self.resp_p = p;
+            if let Some(u) = self.upgrade.take() {
+                let cap = self.ctx.opts.body_max;
+                self.ws = Some((
+                    crate::ws::Dir::new(cap, u.deflate, u.client_no_takeover),
+                    crate::ws::Dir::new(cap, u.deflate, u.server_no_takeover),
+                    u.url,
+                ));
+                // Frames that arrived in the same read as the 101.
+                let rest = self.resp_p.take_rest();
+                if !rest.is_empty() {
+                    self.feed_ws(true, &rest);
+                }
+            }
         } else {
             let mut p = std::mem::replace(&mut self.req_p, Parser::new(false));
             p.feed(d, &mut ReqSink(self));
             self.req_p = p;
+        }
+    }
+
+    fn feed_ws(&mut self, response: bool, d: &[u8]) {
+        let Some((c, s, url)) = &mut self.ws else { return };
+        let mut msgs = Vec::new();
+        if response { s.feed(d, &mut msgs) } else { c.feed(d, &mut msgs) }
+        let url = url.clone();
+        for msg in msgs {
+            let mut m = record("ws", self.base.conn);
+            m.insert("client_port".into(), json!(self.base.client.port()));
+            if let Some(w) = &self.base.who {
+                m.extend(w.clone());
+            }
+            m.insert("url".into(), json!(url));
+            m.insert("direction".into(), json!(if response { "received" } else { "sent" }));
+            m.insert("opcode".into(), json!(crate::ws::opcode_name(msg.opcode)));
+            m.insert("bytes".into(), json!(msg.wire_bytes));
+            if msg.truncated {
+                m.insert("truncated".into(), json!(true));
+            }
+            if msg.undecoded {
+                m.insert("undecoded".into(), json!(true));
+            } else if msg.opcode == 8 && msg.data.len() >= 2 {
+                m.insert("close_code".into(), json!(u16::from_be_bytes([msg.data[0], msg.data[1]])));
+                m.insert("reason".into(), json!(String::from_utf8_lossy(&msg.data[2..])));
+            } else if !msg.data.is_empty() {
+                match std::str::from_utf8(&msg.data) {
+                    Ok(t) => {
+                        let v = serde_json::from_str::<Value>(t).ok().filter(|v| v.is_object() || v.is_array());
+                        m.insert("data".into(), v.unwrap_or_else(|| json!(t)));
+                    }
+                    Err(_) => {
+                        use base64::Engine;
+                        m.insert(
+                            "data_base64".into(),
+                            json!(base64::engine::general_purpose::STANDARD.encode(&msg.data)),
+                        );
+                    }
+                }
+            }
+            let _ = self.ctx.tx.send(m);
+        }
+    }
+
+    fn url_of(&self, target: &str) -> String {
+        let default_port = if self.scheme == "https" { 443 } else { 80 };
+        let host = if self.base.port == default_port {
+            self.base.host.clone()
+        } else {
+            format!("{}:{}", self.base.host, self.base.port)
+        };
+        if target.starts_with('/') {
+            format!("{}://{host}{target}", self.scheme)
+        } else {
+            target.to_owned() // absolute-form (plain HTTP proxying)
         }
     }
 
@@ -529,27 +614,36 @@ impl Conv {
         let _ = self.ctx.tx.send(m);
     }
 
-    fn emit(&mut self, seq: u64) {
-        let Some(x) = self.open.remove(&seq) else { return };
-        let keep = self.ctx.opts.keep_secrets;
-        let mut m = record("http", self.base.conn);
+    /// Fields shared by `http` and `http_request`: who, where, what.
+    fn exchange_record(&self, kind: &str, seq: u64, x: &Exchange) -> Map<String, Value> {
+        let mut m = record(kind, self.base.conn);
         m.insert("time".into(), json!(crate::log::rfc3339(x.time_ns)));
+        // (conn, seq) identifies the exchange across both record types.
+        m.insert("seq".into(), json!(seq));
+        m.insert("client_port".into(), json!(self.base.client.port()));
         if let Some(w) = &self.base.who {
             m.extend(w.clone());
         }
-        let default_port = if self.scheme == "https" { 443 } else { 80 };
-        let host = if self.base.port == default_port {
-            self.base.host.clone()
-        } else {
-            format!("{}:{}", self.base.host, self.base.port)
-        };
-        let url = if x.req.target.starts_with('/') {
-            format!("{}://{host}{}", self.scheme, x.req.target)
-        } else {
-            x.req.target.clone() // absolute-form (plain HTTP proxying)
-        };
+        let url = self.url_of(&x.req.target);
         m.insert("method".into(), json!(x.req.method));
         m.insert("url".into(), json!(url));
+        m
+    }
+
+    /// The request has gone out. Logged right away, without the body, so
+    /// there is a trace of it even if the response never completes or
+    /// agentbox dies first; the full `http` record follows at the end.
+    fn request_sent(&mut self, seq: u64) {
+        let Some(x) = self.open.get(&seq) else { return };
+        let mut m = self.exchange_record("http_request", seq, x);
+        m.insert("body_bytes".into(), json!(x.req_body.total));
+        let _ = self.ctx.tx.send(m);
+    }
+
+    fn emit(&mut self, seq: u64) {
+        let Some(x) = self.open.remove(&seq) else { return };
+        let keep = self.ctx.opts.keep_secrets;
+        let mut m = self.exchange_record("http", seq, &x);
 
         let mut rq = Map::new();
         rq.insert("headers".into(), http::headers_json(&x.req, keep));
@@ -623,8 +717,10 @@ impl Sink for ReqSink<'_> {
     }
     fn end(&mut self) {
         let c = &mut *self.0;
-        if let Some(x) = c.cur_req.take().and_then(|s| c.open.get_mut(&s)) {
+        let Some(seq) = c.cur_req.take() else { return };
+        if let Some(x) = c.open.get_mut(&seq) {
             x.req_complete = true;
+            c.request_sent(seq);
         }
     }
     fn error(&mut self, why: String) {
@@ -643,8 +739,22 @@ impl Sink for RespSink<'_> {
             return Framing::Empty;
         }
         let f = if h.status == 101 {
-            // Protocol switch (websocket...): stop parsing both directions.
+            // Protocol switch: HTTP parsing stops in both directions. If it
+            // is a WebSocket, the frame parsers take over (see Conv::feed).
             c.req_p.stop();
+            let hdr = |h: &Head, n: &str| {
+                h.header(n).map(|v| String::from_utf8_lossy(v).to_ascii_lowercase()).unwrap_or_default()
+            };
+            if hdr(&h, "upgrade").contains("websocket") {
+                let ext = hdr(&h, "sec-websocket-extensions");
+                let target = c.open.get(&seq).map(|x| x.req.target.clone()).unwrap_or_default();
+                c.upgrade = Some(Upgrade {
+                    url: c.url_of(&target).replacen("http", "ws", 1),
+                    deflate: ext.contains("permessage-deflate"),
+                    client_no_takeover: ext.contains("client_no_context_takeover"),
+                    server_no_takeover: ext.contains("server_no_context_takeover"),
+                });
+            }
             Framing::Stop
         } else if is_head || h.status == 204 || h.status == 304 {
             Framing::Empty
@@ -710,6 +820,8 @@ where
     };
     let conv = Arc::new(Mutex::new(Conv {
         flow,
+        upgrade: None,
+        ws: None,
         ctx: ctx.clone(),
         base,
         scheme,

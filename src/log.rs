@@ -11,9 +11,30 @@ use std::io::Write;
 use serde_json::{json, Map, Value};
 
 use crate::events::{
-    cstr, path_at, split_nul, ConnectEvent, Event, Exec, ExecDenied, ExecRequest, ExecResult, FileEvent,
-    Header, DENY_BY_INODE, DENY_BY_NAME, FOP_MKDIR, FOP_OPEN, FOP_RENAME, FOP_RMDIR, FOP_UNLINK, REQ_TRUNCATED, REQ_UNREADABLE,
+    cstr, path_at, split_nul, ConnectEvent, Event, Exec, ExecDenied, ExecRequest, ExecResult, ExitEvent,
+    FileEvent, ForkEvent, Header, SysDenied, DENY_BY_INODE, DENY_BY_NAME, FOP_CHMOD, FOP_CHOWN, FOP_EXEC_MAP, FOP_LINK,
+    FOP_MKDIR, FOP_MKNOD, FOP_OPEN, FOP_RENAME, FOP_RMDIR, FOP_SYMLINK, FOP_TRUNCATE, FOP_UNLINK, FOP_XATTR, NOP_ACCEPT,
+    NOP_BIND, NOP_LISTEN, NOP_SENDMMSG, NOP_SENDTO, REQ_TRUNCATED, REQ_UNREADABLE,
 };
+use crate::watch::Watch;
+
+/// What the sandbox's init does before starting the agent, so the log can
+/// say whether each kind of hook is actually delivering events (see
+/// `sandbox::canary`). The canary is always pid 2 in the sandbox.
+pub const CANARY_FILE: &str = "/tmp/.agentbox-canary";
+pub const CANARY_EXEC: &str = "/.agentbox-canary";
+pub const CANARY_ADDR: &str = "127.0.0.1:1";
+const CANARY_NS_PID: u32 = 2;
+
+#[derive(Default)]
+struct SelfTest {
+    exec_request: bool,
+    exec_result: bool,
+    file: bool,
+    connect: bool,
+    fork: bool,
+    exit: bool,
+}
 
 struct Pending {
     syscall: &'static str,
@@ -56,6 +77,22 @@ pub struct Logger<W: Write> {
     pub mismatches: u64,
     pub denied: u64,
     pub http: u64,
+    pub exits: u64,
+    pub forks: u64,
+    pub sys_denied: u64,
+    pub watched: u64,
+    pub net_ops: u64,
+    /// Reads of these paths are always logged.
+    pub watch: Watch,
+    /// The optional hooks (lifecycle, extra file/net ops) are loaded.
+    pub extras: bool,
+    /// Optional hook tiers loaded: 0 = core hooks only ... 3 = everything.
+    pub hook_level: u8,
+    pub exec_maps: u64,
+    pub ws: u64,
+    self_test: SelfTest,
+    /// The agent has exec'd: the canary phase is over.
+    canary_done: bool,
     /// Threads whose exec was just refused by --deny: the EACCES that the
     /// syscall then returns is already reported by the exec_denied record.
     denied_tids: HashSet<u32>,
@@ -130,7 +167,7 @@ fn argv_relation(req: &Pending, actual: &[String], actual_truncated: bool) -> &'
 impl<W: Write> Logger<W> {
     pub fn new(out: W, env_mode: Option<EnvMode>) -> Self {
         let boot_to_unix_ns = clock_ns(libc::CLOCK_REALTIME) - clock_ns(libc::CLOCK_BOOTTIME);
-        Self { out, env_mode, files: 0, connects: 0, pending: HashMap::new(), held: HashMap::new(), boot_to_unix_ns, execs: 0, failed: 0, mismatches: 0, denied: 0, http: 0, denied_tids: HashSet::new() }
+        Self { out, env_mode, files: 0, connects: 0, pending: HashMap::new(), held: HashMap::new(), boot_to_unix_ns, execs: 0, failed: 0, mismatches: 0, denied: 0, http: 0, denied_tids: HashSet::new(), exits: 0, forks: 0, sys_denied: 0, watched: 0, net_ops: 0, watch: Watch::default(), extras: false, hook_level: 0, exec_maps: 0, ws: 0, self_test: SelfTest::default(), canary_done: false }
     }
 
     fn base(&self, kind: &str, h: &Header, comm: Option<&[u8]>) -> Map<String, Value> {
@@ -167,13 +204,125 @@ impl<W: Write> Logger<W> {
             Event::File(f) => self.on_file(&f),
             Event::Connect(c) => self.on_connect(&c),
             Event::Denied(d) => self.on_denied(&d),
+            Event::Exit(e) => self.on_exit(&e),
+            Event::Fork(f) => self.on_fork(&f),
+            Event::SysDenied(d) => self.on_sys_denied(&d),
         }
+    }
+
+    /// agentbox's own sandbox plumbing, not the agent: init (pid 1 in the
+    /// sandbox), and the helper, which sits in the cgroup but outside the
+    /// sandbox's pid namespace (so its namespace pid is its host pid).
+    fn own(h: &Header) -> bool {
+        h.ns_pid == 1 || h.ns_pid == h.pid
+    }
+
+    fn is_canary(&self, h: &Header) -> bool {
+        !self.canary_done && h.ns_pid == CANARY_NS_PID
+    }
+
+    fn self_test_json(&self) -> Value {
+        let t = &self.self_test;
+        let mut m = Map::new();
+        m.insert("exec_request".into(), json!(t.exec_request));
+        m.insert("exec_result".into(), json!(t.exec_result));
+        m.insert("file".into(), json!(t.file));
+        m.insert("connect".into(), json!(t.connect));
+        if self.extras {
+            m.insert("fork".into(), json!(t.fork));
+            m.insert("exit".into(), json!(t.exit));
+        }
+        Value::Object(m)
+    }
+
+    /// The canary phase is over: complain, loudly, about any hook that
+    /// stayed silent. A quiet log must not be mistaken for a quiet agent.
+    fn end_canary(&mut self) {
+        if std::mem::replace(&mut self.canary_done, true) {
+            return;
+        }
+        let t = &self.self_test;
+        let mut missing = Vec::new();
+        for (ok, what) in [
+            (t.exec_request, "exec requests (the `requested` half of exec records)"),
+            (t.exec_result, "failed execs"),
+            (t.file, "file operations"),
+            (t.connect, "connects"),
+            (t.fork || !self.extras, "forks"),
+            (t.exit || !self.extras, "process exits"),
+        ] {
+            if !ok {
+                missing.push(what);
+            }
+        }
+        if !missing.is_empty() {
+            eprintln!(
+                "agentbox: WARNING: self-test failed: the kernel hooks delivered no {}. \
+                 Those records will be MISSING from this log.",
+                missing.join(", ")
+            );
+        }
+    }
+
+    fn on_exit(&mut self, e: &ExitEvent) {
+        if self.is_canary(&e.h) {
+            self.self_test.exit = true;
+            return;
+        }
+        if Self::own(&e.h) {
+            return;
+        }
+        self.exits += 1;
+        let mut m = self.base("exit", &e.h, Some(&e.comm));
+        let sig = e.exit_code & 0x7f;
+        if sig != 0 {
+            m.insert("signal".into(), json!(sig));
+            if e.exit_code & 0x80 != 0 {
+                m.insert("core_dumped".into(), json!(true));
+            }
+        } else {
+            m.insert("exit_status".into(), json!((e.exit_code >> 8) & 0xff));
+        }
+        m.insert("duration_ms".into(), json!(e.h.ts_boot_ns.saturating_sub(e.start_boot_ns) / 1_000_000));
+        self.emit(m);
+    }
+
+    fn on_fork(&mut self, f: &ForkEvent) {
+        if !self.canary_done && f.child_ns_pid == CANARY_NS_PID {
+            self.self_test.fork = true;
+            return;
+        }
+        // agentbox's own helper forking the sandbox init.
+        if f.child_ns_pid == 1 {
+            return;
+        }
+        self.forks += 1;
+        let mut m = self.base("fork", &f.h, None);
+        m.insert("child_pid".into(), json!(f.child_pid));
+        m.insert("child_sandbox_pid".into(), json!(f.child_ns_pid));
+        self.emit(m);
+    }
+
+    fn on_sys_denied(&mut self, d: &SysDenied) {
+        if Self::own(&d.h) {
+            return;
+        }
+        self.sys_denied += 1;
+        let mut m = self.base("sys_denied", &d.h, Some(&d.comm));
+        m.insert(
+            "syscall".into(),
+            crate::watch::syscall_name(d.nr).map(Value::from).unwrap_or_else(|| json!(d.nr)),
+        );
+        Self::result_fields(&mut m, d.ret);
+        self.emit(m);
     }
 
     /// A record from outside the BPF stream (the HTTP proxy).
     pub fn record(&mut self, m: Map<String, Value>) {
-        if m.get("type").and_then(Value::as_str) == Some("http") {
-            self.http += 1;
+        match m.get("type").and_then(Value::as_str) {
+            Some("http") => self.http += 1,
+            Some("ws") => self.ws += 1,
+            _ => {}
         }
         self.emit(m);
     }
@@ -214,6 +363,10 @@ impl<W: Write> Logger<W> {
     fn on_request(&mut self, r: &ExecRequest) {
         self.denied_tids.remove(&r.h.tid);
         let (filename, l1) = cstr(&r.filename);
+        if self.is_canary(&r.h) {
+            self.self_test.exec_request |= filename == CANARY_EXEC;
+            return;
+        }
         let n = (r.argv_len as usize).min(r.argv.len());
         let (argv, l2) = split_nul(&r.argv[..n]);
         let (cwd, l3) = path_at(&r.cwd, r.cwd_off);
@@ -262,6 +415,7 @@ impl<W: Write> Logger<W> {
     }
 
     fn on_exec(&mut self, e: &Exec) {
+        self.end_canary();
         self.execs += 1;
         let (filename, l1) = cstr(&e.filename);
         let an = (e.argv_len as usize).min(e.argv.len());
@@ -347,6 +501,10 @@ impl<W: Write> Logger<W> {
         if self.denied_tids.remove(&r.h.tid) && r.ret == -(libc::EACCES as i64) {
             return;
         }
+        if self.is_canary(&r.h) {
+            self.self_test.exec_result = true;
+            return;
+        }
         self.failed += 1;
         let errno = -r.ret;
         let mut m = self.base("exec_failed", &r.h, None);
@@ -389,62 +547,136 @@ impl<W: Write> Logger<W> {
     }
 
     fn on_file(&mut self, f: &FileEvent) {
-        // pid 1 in the sandbox is agentbox's own init building the root.
-        if f.h.ns_pid == 1 {
+        // agentbox's own init building the root.
+        if Self::own(&f.h) {
             return;
         }
-        self.files += 1;
         let op = match f.op {
             FOP_OPEN => "open",
             FOP_UNLINK => "unlink",
             FOP_RMDIR => "rmdir",
             FOP_RENAME => "rename",
             FOP_MKDIR => "mkdir",
+            FOP_LINK => "link",
+            FOP_SYMLINK => "symlink",
+            FOP_CHMOD => "chmod",
+            FOP_CHOWN => "chown",
+            FOP_TRUNCATE => "truncate",
+            FOP_XATTR if f.flags & 1 != 0 => "removexattr",
+            FOP_XATTR => "setxattr",
+            FOP_MKNOD => "mknod",
             _ => "unknown",
         };
         let (path, l1) = cstr(&f.path);
+        if self.is_canary(&f.h) && path == CANARY_FILE {
+            self.self_test.file = true;
+            return;
+        }
+        if f.op == FOP_EXEC_MAP {
+            return self.on_exec_map(f);
+        }
         let (dir, l2) = path_at(&f.dir, f.dir_off);
+        let target = lexical_target(&dir, &path);
+        let mut lossy = l1 || l2;
+        // fchmod/fchown/ftruncate: no path argument, only the fd's file.
+        let by_fd = f.op != FOP_OPEN && (f.actual_off as usize) < crate::events::PATHBUF;
+        let actual = if (f.op == FOP_OPEN && f.ret >= 0) || by_fd {
+            let (a, l3) = path_at(&f.actual, f.actual_off);
+            lossy |= l3;
+            Some(a)
+        } else {
+            None
+        };
+        let target = if by_fd { actual.clone().unwrap_or_default() } else { target };
+        // Watch list: by where the open really went, else by what it named.
+        let watched = f.op == FOP_OPEN
+            && (actual.as_deref().is_some_and(|a| self.watch.matches(a)) || self.watch.matches(&target));
+        if f.watched != 0 && !watched {
+            // The kernel's coarse name filter matched, the real list doesn't.
+            return;
+        }
+        self.files += 1;
         let mut m = self.base("file", &f.h, None);
         m.insert("op".into(), json!(op));
-        m.insert("path".into(), json!(path));
-        m.insert("target".into(), json!(lexical_target(&dir, &path)));
-        if !path.starts_with('/') {
-            m.insert("relative_to".into(), json!(dir));
+        if by_fd {
+            m.insert("fd".into(), json!(f.dirfd));
+        } else {
+            m.insert("path".into(), json!(path));
+            if !path.starts_with('/') {
+                m.insert("relative_to".into(), json!(dir));
+            }
         }
-        let mut lossy = l1 || l2;
+        if watched {
+            self.watched += 1;
+            m.insert("watched".into(), json!(true));
+        }
         match f.op {
             FOP_OPEN => {
                 m.insert("flags".into(), json!(open_flags(f.flags)));
                 if f.flags & (O_CREAT | O_TMPFILE) != 0 {
                     m.insert("mode".into(), json!(format!("{:04o}", f.mode & 0o7777)));
                 }
-                if f.ret >= 0 {
-                    let (actual, l3) = path_at(&f.actual, f.actual_off);
-                    lossy |= l3;
+                if let Some(actual) = &actual {
                     m.insert("fd".into(), json!(f.ret));
                     // Where the kernel says the fd points, after symlinks and
                     // mounts. A mismatch with `target` means the name led
                     // somewhere else (symlink, a rename race, O_TMPFILE...).
-                    let redirected = actual != lexical_target(&dir, &path);
+                    m.insert("resolved_differs".into(), json!(*actual != target));
                     m.insert("resolved".into(), json!(actual));
-                    m.insert("resolved_differs".into(), json!(redirected));
                 }
             }
-            FOP_MKDIR => {
+            FOP_MKDIR | FOP_CHMOD => {
                 m.insert("mode".into(), json!(format!("{:04o}", f.mode & 0o7777)));
             }
-            FOP_RENAME => {
+            FOP_CHOWN => {
+                // -1 leaves that id unchanged.
+                let id = |v: u32| if v == u32::MAX { Value::Null } else { json!(v) };
+                m.insert("new_uid".into(), id(f.flags));
+                m.insert("new_gid".into(), id(f.mode));
+            }
+            FOP_TRUNCATE => {
+                m.insert("length".into(), json!(f.flags as u64 | (f.mode as u64) << 32));
+            }
+            FOP_XATTR if !by_fd => {
+                let (name, l3) = cstr(&f.path2);
+                lossy |= l3;
+                m.insert("attr".into(), json!(name));
+            }
+            FOP_MKNOD => {
+                let kind = match f.mode & 0o170000 {
+                    0o020000 => "char",
+                    0o060000 => "block",
+                    0o010000 => "fifo",
+                    0o140000 => "socket",
+                    _ => "file",
+                };
+                m.insert("node".into(), json!(kind));
+                m.insert("mode".into(), json!(format!("{:04o}", f.mode & 0o7777)));
+                if matches!(kind, "char" | "block") {
+                    // Linux dev_t as userspace encodes it.
+                    let d = f.flags as u64;
+                    let (maj, min) = (((d >> 8) & 0xfff), ((d & 0xff) | ((d >> 12) & 0xfff00)));
+                    m.insert("device".into(), json!(format!("{maj}:{min}")));
+                }
+            }
+            FOP_SYMLINK => {
+                let (to, l3) = cstr(&f.path2);
+                lossy |= l3;
+                m.insert("link_target".into(), json!(to));
+            }
+            FOP_RENAME | FOP_LINK => {
                 let (new, l3) = cstr(&f.path2);
                 let (dir2, l4) = path_at(&f.dir2, f.dir2_off);
                 lossy |= l3 || l4;
                 m.insert("new_path".into(), json!(new));
                 m.insert("new_target".into(), json!(lexical_target(&dir2, &new)));
-                if f.flags != 0 {
+                if f.op == FOP_RENAME && f.flags != 0 {
                     m.insert("rename_flags".into(), json!(rename_flags(f.flags)));
                 }
             }
             _ => {}
         }
+        m.insert("target".into(), json!(target));
         Self::result_fields(&mut m, f.ret);
         if f.req_flags & REQ_UNREADABLE != 0 {
             m.insert("unreadable".into(), json!(true));
@@ -455,14 +687,97 @@ impl<W: Write> Logger<W> {
         self.emit(m);
     }
 
-    fn on_connect(&mut self, c: &ConnectEvent) {
-        if c.h.ns_pid == 1 {
+    /// Code mapped executable from a file the agent could have written
+    /// (dlopen, LD_PRELOAD, native extensions): loading without an exec.
+    fn on_exec_map(&mut self, f: &FileEvent) {
+        if Self::own(&f.h) {
             return;
+        }
+        self.exec_maps += 1;
+        let (path, lossy) = path_at(&f.actual, f.actual_off);
+        let mut m = self.base("exec_map", &f.h, None);
+        m.insert("path".into(), json!(path));
+        if f.mode == 1 {
+            // An existing mapping of the file was made executable.
+            m.insert("via".into(), json!("mprotect"));
+        } else {
+            m.insert("fd".into(), json!(f.dirfd));
+        }
+        if lossy {
+            m.insert("non_utf8".into(), json!(true));
+        }
+        self.emit(m);
+    }
+
+    fn on_connect(&mut self, c: &ConnectEvent) {
+        if Self::own(&c.h) {
+            return;
+        }
+        let (family, requested) = decode_sockaddr(&c.req_addr, c.addrlen as usize);
+        if self.is_canary(&c.h) && requested.as_deref() == Some(CANARY_ADDR) {
+            self.self_test.connect = true;
+            return;
+        }
+        let unreadable = c.req_flags & REQ_UNREADABLE != 0;
+        let local_port = |m: &mut Map<String, Value>| {
+            if c.local_port != 0 {
+                m.insert("local_port".into(), json!(c.local_port));
+            }
+        };
+        match c.op {
+            NOP_BIND | NOP_SENDTO | NOP_SENDMMSG => {
+                self.net_ops += 1;
+                let kind = if c.op == NOP_BIND { "bind" } else { "sendto" };
+                let mut m = self.base(kind, &c.h, None);
+                m.insert("fd".into(), json!(c.fd));
+                m.insert("family".into(), json!(family));
+                m.insert("socket".into(), json!(sock_type(c.sock_type)));
+                m.insert("address".into(), requested.map(Value::from).unwrap_or(Value::Null));
+                local_port(&mut m);
+                if c.op == NOP_SENDTO && c.ret >= 0 {
+                    m.insert("bytes".into(), json!(c.ret));
+                }
+                if c.op == NOP_SENDMMSG && c.ret >= 0 {
+                    // sendmmsg: `address` is the first message's destination.
+                    m.insert("messages".into(), json!(c.ret));
+                }
+                Self::result_fields(&mut m, c.ret);
+                if unreadable {
+                    m.insert("unreadable".into(), json!(true));
+                }
+                return self.emit(m);
+            }
+            NOP_LISTEN => {
+                self.net_ops += 1;
+                let mut m = self.base("listen", &c.h, None);
+                m.insert("fd".into(), json!(c.fd));
+                m.insert("socket".into(), json!(sock_type(c.sock_type)));
+                local_port(&mut m);
+                Self::result_fields(&mut m, c.ret);
+                return self.emit(m);
+            }
+            NOP_ACCEPT => {
+                // A non-blocking accept that found nothing isn't an event.
+                if matches!(-c.ret as i32, libc::EAGAIN | libc::EINTR) {
+                    return;
+                }
+                self.net_ops += 1;
+                let mut m = self.base("accept", &c.h, None);
+                m.insert("fd".into(), json!(c.fd));
+                m.insert("socket".into(), json!(sock_type(c.sock_type)));
+                if c.ret >= 0 {
+                    m.insert("new_fd".into(), json!(c.ret));
+                    m.insert("peer".into(), kernel_peer(c).map(Value::from).unwrap_or(Value::Null));
+                }
+                local_port(&mut m);
+                Self::result_fields(&mut m, c.ret);
+                return self.emit(m);
+            }
+            _ => {}
         }
         self.connects += 1;
         let mut m = self.base("connect", &c.h, None);
         m.insert("fd".into(), json!(c.fd));
-        let (family, requested) = decode_sockaddr(&c.req_addr, c.addrlen as usize);
         m.insert("family".into(), json!(family));
         m.insert("socket".into(), json!(sock_type(c.sock_type)));
         m.insert("requested".into(), requested.clone().map(Value::from).unwrap_or(Value::Null));
@@ -474,7 +789,7 @@ impl<W: Write> Logger<W> {
         m.insert("peer".into(), peer.clone().map(Value::from).unwrap_or(Value::Null));
         let rel = if failed {
             "failed"
-        } else if c.req_flags & REQ_UNREADABLE != 0 {
+        } else if unreadable {
             "unknown"
         } else {
             match (&peer, &requested) {
@@ -484,18 +799,21 @@ impl<W: Write> Logger<W> {
             }
         };
         m.insert("peer_vs_request".into(), json!(rel));
+        // Joins with the proxy's `client_port` on http/http_tunnel records.
+        local_port(&mut m);
         if in_progress {
             m.insert("in_progress".into(), json!(true));
         } else {
             Self::result_fields(&mut m, c.ret);
         }
-        if c.req_flags & REQ_UNREADABLE != 0 {
+        if unreadable {
             m.insert("unreadable".into(), json!(true));
         }
         self.emit(m);
     }
 
-    pub fn summary(&mut self, drops: u64, exit_code: i32, capture: &str, deny: Option<&str>) {
+    pub fn summary(&mut self, drops: &[(&str, u64)], exit_code: i32, capture: &str, deny: Option<&str>) {
+        self.end_canary();
         let tids: Vec<u32> = self.held.keys().copied().collect();
         for t in tids {
             self.flush_held(t);
@@ -507,7 +825,12 @@ impl<W: Write> Logger<W> {
         m.insert("execs".into(), json!(self.execs));
         m.insert("failed_execs".into(), json!(self.failed));
         m.insert("argv_mismatches".into(), json!(self.mismatches));
-        m.insert("dropped_events".into(), json!(drops));
+        m.insert("dropped_events".into(), json!(drops.iter().map(|(_, n)| n).sum::<u64>()));
+        if !drops.is_empty() {
+            // Which record types have holes.
+            let by: Map<String, Value> = drops.iter().map(|(k, n)| (k.to_string(), json!(n))).collect();
+            m.insert("dropped_by_type".into(), Value::Object(by));
+        }
         m.insert("request_capture".into(), json!(capture));
         m.insert("file_ops".into(), json!(self.files));
         m.insert("connects".into(), json!(self.connects));
@@ -516,6 +839,19 @@ impl<W: Write> Logger<W> {
             m.insert("denied_execs".into(), json!(self.denied));
         }
         m.insert("http_requests".into(), json!(self.http));
+        m.insert("net_ops".into(), json!(self.net_ops));
+        m.insert("watched_opens".into(), json!(self.watched));
+        m.insert("sys_denied".into(), json!(self.sys_denied));
+        m.insert("optional_hooks".into(), json!(self.hook_level));
+        m.insert("ws_messages".into(), json!(self.ws));
+        if self.hook_level >= 2 {
+            m.insert("exec_maps".into(), json!(self.exec_maps));
+        }
+        if self.extras {
+            m.insert("forks".into(), json!(self.forks));
+            m.insert("exits".into(), json!(self.exits));
+        }
+        m.insert("self_test".into(), self.self_test_json());
         self.emit(m);
         self.flush();
     }
@@ -652,6 +988,230 @@ mod tests {
         assert_eq!(lexical_target("/a/b", "../c/./d"), "/a/c/d");
         assert_eq!(lexical_target("/a", "/x/y"), "/x/y");
         assert_eq!(lexical_target("/", "x"), "/x");
+    }
+
+    // ---- synthetic events: what the BPF side would send ----
+
+    fn zeroed<T>() -> Box<T> {
+        unsafe { Box::<T>::new_zeroed().assume_init() }
+    }
+
+    fn hdr(ns_pid: u32, tid: u32) -> Header {
+        Header { kind: 0, tid, pid: tid, ppid: 1, ns_pid, uid: 1000, gid: 1000, _pad0: 0, ts_boot_ns: 5_000_000_000 }
+    }
+
+    /// Write a backwards-resolved path so it ends at PATHBUF; returns its offset.
+    fn put_path(buf: &mut [u8], p: &str) -> u32 {
+        let off = crate::events::PATHBUF - p.len();
+        buf[off..crate::events::PATHBUF].copy_from_slice(p.as_bytes());
+        off as u32
+    }
+
+    fn file_ev(ns_pid: u32, op: u32, path: &str, dir: &str) -> Box<FileEvent> {
+        let mut f = zeroed::<FileEvent>();
+        f.h = hdr(ns_pid, 100 + ns_pid);
+        f.op = op;
+        f.dirfd = -100;
+        f.path[..path.len()].copy_from_slice(path.as_bytes());
+        f.dir_off = put_path(&mut f.dir, dir);
+        f.dir2_off = crate::events::PATHBUF as u32;
+        f.actual_off = crate::events::PATHBUF as u32;
+        f
+    }
+
+    fn conn_ev(ns_pid: u32, op: u16, addr: [u8; 4], port: u16) -> ConnectEvent {
+        let mut c = *zeroed::<ConnectEvent>();
+        c.h = hdr(ns_pid, 100 + ns_pid);
+        c.op = op;
+        c.fd = 3;
+        c.sock_type = 1;
+        c.addrlen = 16;
+        c.req_addr[..2].copy_from_slice(&2u16.to_ne_bytes());
+        c.req_addr[2..4].copy_from_slice(&port.to_be_bytes());
+        c.req_addr[4..8].copy_from_slice(&addr);
+        c
+    }
+
+    fn records(l: Logger<Vec<u8>>) -> Vec<Value> {
+        String::from_utf8(l.out).unwrap().lines().map(|x| serde_json::from_str(x).unwrap()).collect()
+    }
+
+    fn logger() -> Logger<Vec<u8>> {
+        let mut l = Logger::new(Vec::new(), None);
+        l.watch = Watch::defaults(std::path::Path::new("/home/u"));
+        l.extras = true;
+        l.hook_level = 3;
+        l
+    }
+
+    fn agent_exec(l: &mut Logger<Vec<u8>>) {
+        let mut e = zeroed::<Exec>();
+        e.h = hdr(3, 103);
+        e.old_tid = 103;
+        e.exe_off = put_path(&mut e.exe, "/usr/bin/agent");
+        e.cwd_off = put_path(&mut e.cwd, "/proj");
+        l.handle(Event::Exec(e));
+    }
+
+    #[test]
+    fn canary_is_recognised_and_hidden() {
+        let mut l = logger();
+        // What sandbox::canary() does, as pid 2.
+        let mut f = file_ev(2, FOP_OPEN, CANARY_FILE, "/");
+        f.flags = 0o101;
+        f.ret = 3;
+        f.actual_off = put_path(&mut f.actual, CANARY_FILE);
+        l.handle(Event::File(f));
+        l.handle(Event::File(file_ev(2, FOP_UNLINK, CANARY_FILE, "/")));
+        let mut c = conn_ev(2, 0, [127, 0, 0, 1], 1);
+        c.ret = -(libc::ECONNREFUSED as i64);
+        l.handle(Event::Connect(c));
+        let mut r = zeroed::<ExecRequest>();
+        r.h = hdr(2, 102);
+        r.filename[..CANARY_EXEC.len()].copy_from_slice(CANARY_EXEC.as_bytes());
+        l.handle(Event::Request(r));
+        l.handle(Event::Result(ExecResult { h: hdr(2, 102), ret: -2 }));
+        l.handle(Event::Fork(ForkEvent { h: hdr(1, 101), child_pid: 102, child_ns_pid: 2 }));
+        let mut x = *zeroed::<ExitEvent>();
+        x.h = hdr(2, 102);
+        l.handle(Event::Exit(x));
+        agent_exec(&mut l);
+        // After the agent starts, pid-2-looking events are ordinary again.
+        assert!(l.canary_done);
+        l.summary(&[("file", 7)], 0, "sleepable", None);
+        let recs = records(l);
+        assert_eq!(recs.len(), 2, "only the agent's exec and the summary: {recs:?}");
+        let sum = &recs[1];
+        for k in ["exec_request", "exec_result", "file", "connect", "fork", "exit"] {
+            assert_eq!(sum["self_test"][k], true, "{k}");
+        }
+        assert_eq!(sum["failed_execs"], 0);
+        assert_eq!(sum["file_ops"], 0);
+        assert_eq!(sum["dropped_events"], 7);
+        assert_eq!(sum["dropped_by_type"]["file"], 7);
+        assert_eq!(sum["optional_hooks"], 3);
+    }
+
+    #[test]
+    fn silent_hooks_fail_the_self_test() {
+        let mut l = logger();
+        agent_exec(&mut l); // no canary events arrived at all
+        l.summary(&[], 0, "sleepable", None);
+        let recs = records(l);
+        assert_eq!(recs[1]["self_test"]["file"], false);
+        assert_eq!(recs[1]["self_test"]["connect"], false);
+    }
+
+    #[test]
+    fn new_record_shapes() {
+        let mut l = logger();
+        agent_exec(&mut l);
+
+        // Watched read: reported. Same coarse kernel match elsewhere: dropped.
+        for (dir, keep) in [("/home/u/.ssh", true), ("/proj/src/.ssh-notes", false)] {
+            let mut f = file_ev(4, FOP_OPEN, "id_ed25519", dir);
+            f.watched = 1;
+            f.ret = 5;
+            f.actual_off = put_path(&mut f.actual, &format!("{dir}/id_ed25519"));
+            l.handle(Event::File(f));
+            assert_eq!(l.watched, 1, "{dir} keep={keep}");
+        }
+        // fchmod by fd.
+        let mut f = file_ev(4, FOP_CHMOD, "", "/");
+        f.dir_off = crate::events::PATHBUF as u32;
+        f.dirfd = 7;
+        f.mode = 0o600;
+        f.actual_off = put_path(&mut f.actual, "/tmp/x");
+        l.handle(Event::File(f));
+        // setxattr by path.
+        let mut f = file_ev(4, FOP_XATTR, "bin/tool", "/proj");
+        f.path2[..19].copy_from_slice(b"security.capability");
+        f.ret = -1;
+        l.handle(Event::File(f));
+        // mknod of a char device (1:3 = /dev/null).
+        let mut f = file_ev(4, FOP_MKNOD, "/tmp/null", "/");
+        f.mode = 0o020666;
+        f.flags = (1 << 8) | 3;
+        f.ret = -1;
+        l.handle(Event::File(f));
+        // Library load from /tmp, then via mprotect.
+        for via_mprotect in [0, 1] {
+            let mut f = file_ev(4, FOP_EXEC_MAP, "", "/");
+            f.dirfd = 9;
+            f.mode = via_mprotect;
+            f.actual_off = put_path(&mut f.actual, "/tmp/hook.so");
+            l.handle(Event::File(f));
+        }
+        // Sockets.
+        let mut c = conn_ev(4, NOP_BIND, [0, 0, 0, 0], 8000);
+        c.local_port = 8000;
+        l.handle(Event::Connect(c));
+        let mut c = conn_ev(4, NOP_ACCEPT, [0, 0, 0, 0], 0);
+        c.ret = -(libc::EAGAIN as i64);
+        l.handle(Event::Connect(c)); // dropped
+        let mut c = conn_ev(4, NOP_SENDMMSG, [8, 8, 8, 8], 53);
+        c.ret = 2;
+        l.handle(Event::Connect(c));
+        let mut c = conn_ev(4, 0, [1, 2, 3, 4], 443);
+        c.local_port = 45000;
+        c.peer_family = 2;
+        c.peer_port = 443u16.to_be();
+        c.peer_addr[..4].copy_from_slice(&[1, 2, 3, 4]);
+        l.handle(Event::Connect(c));
+        // agentbox's helper (not in the pid namespace) opening the proxy port.
+        let mut c = conn_ev(4, NOP_BIND, [127, 0, 0, 1], 3128);
+        c.h.ns_pid = c.h.pid;
+        l.handle(Event::Connect(c));
+        // Lifecycle and refused privilege.
+        l.handle(Event::Fork(ForkEvent { h: hdr(3, 103), child_pid: 104, child_ns_pid: 4 }));
+        let mut x = *zeroed::<ExitEvent>();
+        x.h = hdr(4, 104);
+        x.exit_code = 3 << 8;
+        x.start_boot_ns = 4_000_000_000;
+        l.handle(Event::Exit(x));
+        let mut x = *zeroed::<ExitEvent>();
+        x.h = hdr(5, 105);
+        x.exit_code = 9;
+        l.handle(Event::Exit(x));
+        let mut d = *zeroed::<SysDenied>();
+        d.h = hdr(4, 104);
+        d.nr = libc::SYS_unshare as u32;
+        d.ret = -1;
+        l.handle(Event::SysDenied(d));
+
+        let recs = records(l);
+        let find = |t: &str, k: &str, v: &str| {
+            recs.iter().find(|r| r["type"] == t && r[k] == v).unwrap_or_else(|| panic!("no {t} {k}={v}: {recs:#?}")).clone()
+        };
+        let r = find("file", "op", "open");
+        assert_eq!((r["watched"].clone(), r["resolved"].clone()), (json!(true), json!("/home/u/.ssh/id_ed25519")));
+        assert_eq!(recs.iter().filter(|r| r["op"] == "open").count(), 1);
+        let r = find("file", "op", "chmod");
+        assert_eq!((r["fd"].clone(), r["target"].clone(), r["mode"].clone()), (json!(7), json!("/tmp/x"), json!("0600")));
+        assert!(r.get("path").is_none());
+        let r = find("file", "op", "setxattr");
+        assert_eq!((r["attr"].clone(), r["target"].clone(), r["errno"].clone()), (json!("security.capability"), json!("/proj/bin/tool"), json!(1)));
+        let r = find("file", "op", "mknod");
+        assert_eq!((r["node"].clone(), r["device"].clone()), (json!("char"), json!("1:3")));
+        let maps: Vec<_> = recs.iter().filter(|r| r["type"] == "exec_map").collect();
+        assert_eq!(maps.len(), 2);
+        assert_eq!((maps[0]["path"].clone(), maps[0]["fd"].clone()), (json!("/tmp/hook.so"), json!(9)));
+        assert_eq!(maps[1]["via"], "mprotect");
+        let r = find("bind", "address", "0.0.0.0:8000");
+        assert_eq!(r["local_port"], 8000);
+        assert!(!recs.iter().any(|r| r["type"] == "accept"));
+        assert!(!recs.iter().any(|r| r["address"] == "127.0.0.1:3128"));
+        let r = find("sendto", "address", "8.8.8.8:53");
+        assert_eq!(r["messages"], 2);
+        let r = find("connect", "requested", "1.2.3.4:443");
+        assert_eq!((r["local_port"].clone(), r["peer_vs_request"].clone()), (json!(45000), json!("identical")));
+        let r = find("fork", "type", "fork");
+        assert_eq!(r["child_pid"], 104);
+        let exits: Vec<_> = recs.iter().filter(|r| r["type"] == "exit").collect();
+        assert_eq!((exits[0]["exit_status"].clone(), exits[0]["duration_ms"].clone()), (json!(3), json!(1000)));
+        assert_eq!(exits[1]["signal"], 9);
+        let r = find("sys_denied", "syscall", "unshare");
+        assert_eq!(r["errno"], 1);
     }
 
     #[test]

@@ -34,16 +34,17 @@ const volatile __u64 target_cgid = 0;
 const volatile bool capture_env = false;
 const volatile bool log_reads = false;
 const volatile __u32 deny_mode = DENY_OFF;
+const volatile bool watch_reads = false;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 64 * 1024 * 1024);
 } events SEC(".maps");
 
-/* Events dropped because the ring buffer was full. */
+/* Events dropped because the ring buffer was full, per event kind. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, DROP_KINDS);
 	__type(key, __u32);
 	__type(value, __u64);
 } drops SEC(".maps");
@@ -118,7 +119,9 @@ static __always_inline bool in_sandbox(void)
 static __always_inline void submit(void *ev, __u64 size)
 {
 	if (bpf_ringbuf_output(&events, ev, size, 0)) {
-		__u64 *v = bpf_map_lookup_elem(&drops, &ZERO);
+		/* every event starts with ev_header.kind */
+		__u32 kind = *(__u32 *)ev & (DROP_KINDS - 1);
+		__u64 *v = bpf_map_lookup_elem(&drops, &kind);
 		if (v)
 			__sync_fetch_and_add(v, 1);
 	}
@@ -187,6 +190,54 @@ static __always_inline __u32 deny_match(struct file *f, char name[NAME_MAX_ + 1]
 		return DENY_BY_NAME;
 	return 0;
 }
+
+/* Watched reads: read-only opens are normally not reported (too many), but
+ * a file is if its own name or one of its parent directories' names is in
+ * this set (".ssh", ".aws", ...). That is a coarse filter; userspace then
+ * checks the full path against the real watch list. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, char[NAME_MAX_ + 1]);
+	__type(value, __u32);
+} watch_name SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, char[NAME_MAX_ + 1]);
+} watch_key SEC(".maps");
+
+#define WATCH_DEPTH 8
+
+static __always_inline bool watch_match(struct file *f)
+{
+	char *k = bpf_map_lookup_elem(&watch_key, &ZERO);
+	if (!k || !f)
+		return false;
+	struct dentry *d = BPF_CORE_READ(f, f_path.dentry);
+	for (int i = 0; i < WATCH_DEPTH; i++) {
+		__builtin_memset(k, 0, NAME_MAX_ + 1);
+		const unsigned char *n = BPF_CORE_READ(d, d_name.name);
+		bpf_probe_read_kernel_str(k, NAME_MAX_ + 1, n);
+		if (bpf_map_lookup_elem(&watch_name, k))
+			return true;
+		struct dentry *parent = BPF_CORE_READ(d, d_parent);
+		if (parent == d)
+			break;
+		d = parent;
+	}
+	return false;
+}
+
+/* Privileged syscalls whose failure is worth a record (filled by userspace). */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u32);
+	__type(value, __u32);
+} watch_sys SEC(".maps");
 
 /* ------------------------------------------------------------ path walking */
 
@@ -557,7 +608,16 @@ enum sc_id {
 	SC_UNLINK, SC_UNLINKAT, SC_RMDIR,
 	SC_RENAME, SC_RENAMEAT, SC_RENAMEAT2,
 	SC_MKDIR, SC_MKDIRAT,
-	SC_CONNECT,
+	SC_LINK, SC_LINKAT, SC_SYMLINK, SC_SYMLINKAT,
+	SC_CHMOD, SC_FCHMODAT, SC_CHOWN, SC_LCHOWN, SC_FCHOWNAT,
+	SC_TRUNCATE,
+	/* by file descriptor: finished by finish_fdop */
+	SC_FCHMOD, SC_FCHOWN, SC_FTRUNCATE, SC_MMAP,
+	/* third optional tier */
+	SC_SETXATTR, SC_LSETXATTR, SC_FSETXATTR, SC_REMOVEXATTR, SC_LREMOVEXATTR, SC_FREMOVEXATTR,
+	SC_MKNOD, SC_MKNODAT, SC_MPROTECT,
+	/* socket ops: everything from here on is finished by finish_connect */
+	SC_CONNECT = 100, SC_BIND, SC_LISTEN, SC_ACCEPT, SC_SENDTO, SC_SENDMMSG,
 };
 
 struct pending_op {
@@ -634,15 +694,18 @@ static __always_inline bool open_wanted(__u64 flags)
 
 static __always_inline int stash_open(__u32 sc, __s32 dirfd, const char *path, __u64 flags, __u32 mode)
 {
-	if (!open_wanted(flags))
+	/* With a watch list, read-only opens are stashed too and filtered at
+	 * exit, once the kernel has resolved which file it was. */
+	if (!open_wanted(flags) && !watch_reads)
 		return 0;
 	return stash_path(sc, FOP_OPEN, dirfd, path, (__u32)flags, mode);
 }
 
-static __always_inline int stash_rename(__u32 sc, __s32 olddfd, const char *oldp, __s32 newdfd,
-					const char *newp, __u32 flags)
+/* Two-path ops: rename, link (old, new) and symlink (link path, target). */
+static __always_inline int stash_two(__u32 sc, __u32 op, __s32 olddfd, const char *oldp,
+				     __s32 newdfd, const char *newp, __u32 flags)
 {
-	struct pending_op *p = begin(sc, FOP_RENAME);
+	struct pending_op *p = begin(sc, op);
 	if (!p)
 		return 0;
 	p->dirfd = olddfd;
@@ -676,34 +739,75 @@ ENTER(unlinkat) { return stash_path(SC_UNLINKAT, (ARG(2) & AT_REMOVEDIR_) ? FOP_
 				    ARG(0), (const char *)ARG(1), ARG(2), 0); }
 ENTER(rmdir)    { return stash_path(SC_RMDIR, FOP_RMDIR, AT_FDCWD_, (const char *)ARG(0), 0, 0); }
 
-ENTER(rename)    { return stash_rename(SC_RENAME, AT_FDCWD_, (const char *)ARG(0), AT_FDCWD_,
+ENTER(rename)    { return stash_two(SC_RENAME, FOP_RENAME, AT_FDCWD_, (const char *)ARG(0), AT_FDCWD_,
 					   (const char *)ARG(1), 0); }
-ENTER(renameat)  { return stash_rename(SC_RENAMEAT, ARG(0), (const char *)ARG(1), ARG(2),
+ENTER(renameat)  { return stash_two(SC_RENAMEAT, FOP_RENAME, ARG(0), (const char *)ARG(1), ARG(2),
 					   (const char *)ARG(3), 0); }
-ENTER(renameat2) { return stash_rename(SC_RENAMEAT2, ARG(0), (const char *)ARG(1), ARG(2),
+ENTER(renameat2) { return stash_two(SC_RENAMEAT2, FOP_RENAME, ARG(0), (const char *)ARG(1), ARG(2),
 					   (const char *)ARG(3), ARG(4)); }
 
 ENTER(mkdir)   { return stash_path(SC_MKDIR, FOP_MKDIR, AT_FDCWD_, (const char *)ARG(0), 0, ARG(1)); }
 ENTER(mkdirat) { return stash_path(SC_MKDIRAT, FOP_MKDIR, ARG(0), (const char *)ARG(1), 0, ARG(2)); }
 
-ENTER(connect)
+/* Optional hooks from here on (userspace can leave them unloaded). */
+ENTER(link)      { return stash_two(SC_LINK, FOP_LINK, AT_FDCWD_, (const char *)ARG(0), AT_FDCWD_,
+				    (const char *)ARG(1), 0); }
+ENTER(linkat)    { return stash_two(SC_LINKAT, FOP_LINK, ARG(0), (const char *)ARG(1), ARG(2),
+				    (const char *)ARG(3), ARG(4)); }
+/* symlink: path = the link being created, path2 = its target text */
+ENTER(symlink)   { return stash_two(SC_SYMLINK, FOP_SYMLINK, AT_FDCWD_, (const char *)ARG(1),
+				    AT_FDCWD_, (const char *)ARG(0), 0); }
+ENTER(symlinkat) { return stash_two(SC_SYMLINKAT, FOP_SYMLINK, ARG(1), (const char *)ARG(2),
+				    AT_FDCWD_, (const char *)ARG(0), 0); }
+ENTER(chmod)     { return stash_path(SC_CHMOD, FOP_CHMOD, AT_FDCWD_, (const char *)ARG(0), 0, ARG(1)); }
+ENTER(fchmodat)  { return stash_path(SC_FCHMODAT, FOP_CHMOD, ARG(0), (const char *)ARG(1), 0, ARG(2)); }
+/* chown: flags = uid, mode = gid */
+ENTER(chown)     { return stash_path(SC_CHOWN, FOP_CHOWN, AT_FDCWD_, (const char *)ARG(0), ARG(1), ARG(2)); }
+ENTER(lchown)    { return stash_path(SC_LCHOWN, FOP_CHOWN, AT_FDCWD_, (const char *)ARG(0), ARG(1), ARG(2)); }
+ENTER(fchownat)  { return stash_path(SC_FCHOWNAT, FOP_CHOWN, ARG(0), (const char *)ARG(1), ARG(2), ARG(3)); }
+/* truncate: flags = length (low 32 bits), mode = high 32 bits */
+ENTER(truncate)  { return stash_path(SC_TRUNCATE, FOP_TRUNCATE, AT_FDCWD_, (const char *)ARG(0),
+				     (__u32)ARG(1), (__u32)(ARG(1) >> 32)); }
+
+static __always_inline int stash_addr(__u32 sc, __s32 fd, const void *addr, __u64 addrlen)
 {
-	struct pending_op *p = begin(SC_CONNECT, 0);
+	struct pending_op *p = begin(sc, 0);
 	if (!p)
 		return 0;
-	p->fd = ARG(0);
+	p->fd = fd;
 	/* Clamp in a 64-bit register the compiler can't narrow: with a __u32 len,
 	 * clang compares only the low half (the helper's size param is u32) but
 	 * passes the full register, so the verifier sees an unbounded size and
 	 * rejects the program with -EACCES. */
-	__u64 len = (__u32)ARG(2);
+	__u64 len = (__u32)addrlen;
 	barrier_var(len);
 	if (len > SOCKADDR_MAX)
 		len = SOCKADDR_MAX;
-	p->addrlen = ARG(2);
-	if (bpf_probe_read_user(p->addr, len, (void *)ARG(1)))
+	p->addrlen = addrlen;
+	if (bpf_probe_read_user(p->addr, len, addr))
 		p->req_flags |= REQ_UNREADABLE;
 	return 0;
+}
+
+static __always_inline int stash_fd(__u32 sc, __s32 fd)
+{
+	struct pending_op *p = begin(sc, 0);
+	if (p)
+		p->fd = fd;
+	return 0;
+}
+
+ENTER(connect) { return stash_addr(SC_CONNECT, ARG(0), (const void *)ARG(1), ARG(2)); }
+ENTER(bind)    { return stash_addr(SC_BIND, ARG(0), (const void *)ARG(1), ARG(2)); }
+ENTER(listen)  { return stash_fd(SC_LISTEN, ARG(0)); }
+ENTER(accept)  { return stash_fd(SC_ACCEPT, ARG(0)); }
+ENTER(accept4) { return stash_fd(SC_ACCEPT, ARG(0)); }
+/* Only sends that name a destination (unconnected UDP and friends). */
+ENTER(sendto)
+{
+	if (!ARG(4))
+		return 0;
+	return stash_addr(SC_SENDTO, ARG(0), (const void *)ARG(4), ARG(5));
 }
 
 /* fd -> struct file *, via the task's fd table */
@@ -747,14 +851,18 @@ static __always_inline int finish_connect(union scratch *s, struct pending_op *p
 	e->req_flags = p->req_flags;
 	e->ret = ret;
 	e->addrlen = p->addrlen;
-	e->_pad = 0;
+	e->op = p->sc == SC_BIND ? NOP_BIND : p->sc == SC_LISTEN ? NOP_LISTEN :
+		p->sc == SC_ACCEPT ? NOP_ACCEPT : p->sc == SC_SENDTO ? NOP_SENDTO :
+		p->sc == SC_SENDMMSG ? NOP_SENDMMSG : NOP_CONNECT;
+	e->local_port = 0;
 	e->peer_family = 0;
 	e->peer_port = 0;
 	e->sock_type = 0;
 	__builtin_memset(e->peer_addr, 0, sizeof(e->peer_addr));
 	bpf_probe_read_kernel(e->req_addr, sizeof(e->req_addr), p->addr);
 
-	struct file *f = fd_file(task, p->fd);
+	/* accept: describe the new connection's socket, not the listener */
+	struct file *f = fd_file(task, p->sc == SC_ACCEPT ? (int)ret : p->fd);
 	if (f) {
 		umode_t m = BPF_CORE_READ(f, f_inode, i_mode);
 		if ((m & S_IFMT_) == S_IFSOCK_) {
@@ -763,6 +871,7 @@ static __always_inline int finish_connect(union scratch *s, struct pending_op *p
 			e->sock_type = BPF_CORE_READ(sock, type);
 			e->peer_family = BPF_CORE_READ(sk, __sk_common.skc_family);
 			e->peer_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+			e->local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
 			if (e->peer_family == 2 /* AF_INET */) {
 				__u32 d = BPF_CORE_READ(sk, __sk_common.skc_daddr);
 				__builtin_memcpy(e->peer_addr, &d, 4);
@@ -787,8 +896,14 @@ static __always_inline int finish(__u32 sc, long ret)
 	union scratch *s = scratch();
 	if (!s)
 		return 0;
-	if (sc == SC_CONNECT)
+	if (sc >= SC_CONNECT)
 		return finish_connect(s, p, task, ret);
+
+	/* A read-only open only got this far because of the watch list: report
+	 * it if it succeeded and the file is under a watched name. */
+	bool quiet_read = p->op == FOP_OPEN && !open_wanted(p->flags);
+	if (quiet_read && (ret < 0 || !watch_match(fd_file(task, ret))))
+		return 0;
 
 	struct file_event *e = &s->file;
 	fill_header(&e->h, EV_FILE);
@@ -799,15 +914,16 @@ static __always_inline int finish(__u32 sc, long ret)
 	e->mode = p->mode;
 	e->req_flags = p->req_flags;
 	e->ret = ret;
-	e->_pad = 0;
+	e->watched = quiet_read;
 	bpf_probe_read_kernel_str(e->path, sizeof(e->path), p->path);
 	bpf_probe_read_kernel_str(e->path2, sizeof(e->path2), p->path2);
 
 	struct path root = {}, pwd = {};
 	task_paths(task, &root, &pwd);
 	e->dir_off = resolve_dirfd(e->dir, task, p->dirfd, &pwd, &root);
-	e->dir2_off = p->op == FOP_RENAME ? resolve_dirfd(e->dir2, task, p->dirfd2, &pwd, &root)
-					 : PATHBUF;
+	e->dir2_off = (p->op == FOP_RENAME || p->op == FOP_LINK)
+			      ? resolve_dirfd(e->dir2, task, p->dirfd2, &pwd, &root)
+			      : PATHBUF;
 	e->actual_off = PATHBUF;
 	if (p->op == FOP_OPEN && ret >= 0)
 		e->actual_off = resolve_file(e->actual, fd_file(task, ret), &root);
@@ -829,6 +945,296 @@ EXIT(renameat2, SC_RENAMEAT2)
 EXIT(mkdir, SC_MKDIR)
 EXIT(mkdirat, SC_MKDIRAT)
 EXIT(connect, SC_CONNECT)
+EXIT(link, SC_LINK)
+EXIT(linkat, SC_LINKAT)
+EXIT(symlink, SC_SYMLINK)
+EXIT(symlinkat, SC_SYMLINKAT)
+EXIT(chmod, SC_CHMOD)
+EXIT(fchmodat, SC_FCHMODAT)
+EXIT(chown, SC_CHOWN)
+EXIT(lchown, SC_LCHOWN)
+EXIT(fchownat, SC_FCHOWNAT)
+EXIT(truncate, SC_TRUNCATE)
+EXIT(bind, SC_BIND)
+EXIT(listen, SC_LISTEN)
+EXIT(accept, SC_ACCEPT)
+EXIT(accept4, SC_ACCEPT)
+EXIT(sendto, SC_SENDTO)
+
+/* -------------------------------------------------- ops on an open fd
+ *
+ * Second optional tier. fchmod/fchown/ftruncate change a file through a
+ * descriptor, and mmap(PROT_EXEC) of a file is how code gets loaded without
+ * an exec (dlopen, LD_PRELOAD, native extensions). There is no path
+ * argument: the record carries the path the kernel resolves for the fd.
+ */
+#define PROT_EXEC_ 0x4
+#define MAP_ANONYMOUS_ 0x20
+#define MNT_READONLY_ 0x40
+
+static __always_inline int stash_fdop(__u32 sc, __u32 op, __s32 fd, __u32 flags, __u32 mode)
+{
+	struct pending_op *p = begin(sc, op);
+	if (!p)
+		return 0;
+	p->fd = fd;
+	p->flags = flags;
+	p->mode = mode;
+	return 0;
+}
+
+ENTER(fchmod)    { return stash_fdop(SC_FCHMOD, FOP_CHMOD, ARG(0), 0, ARG(1)); }
+ENTER(fchown)    { return stash_fdop(SC_FCHOWN, FOP_CHOWN, ARG(0), ARG(1), ARG(2)); }
+ENTER(ftruncate) { return stash_fdop(SC_FTRUNCATE, FOP_TRUNCATE, ARG(0), (__u32)ARG(1),
+				     (__u32)(ARG(1) >> 32)); }
+ENTER(mmap)
+{
+	if (!(ARG(2) & PROT_EXEC_) || (ARG(3) & MAP_ANONYMOUS_))
+		return 0;
+	return stash_fdop(SC_MMAP, FOP_EXEC_MAP, ARG(4), ARG(2), 0);
+}
+
+static __always_inline int finish_fdop(__u32 sc, long ret)
+{
+	if (!in_sandbox())
+		return 0;
+	struct task_struct *task = bpf_get_current_task_btf();
+	struct pending_op *p = tid_get(&op_store);
+	if (!p || !p->active || p->sc != sc)
+		return 0;
+	p->active = 0;
+	struct file *f = fd_file(task, p->fd);
+	if (!f)
+		return 0;
+	if (sc == SC_MMAP) {
+		/* Failed, or from a read-only mount: the host's own system
+		 * libraries, mapped by every exec. What's worth a record is code
+		 * loaded from somewhere the agent can write. */
+		if (ret < 0 && ret >= -4095)
+			return 0;
+		int mflags = BPF_CORE_READ(f, f_path.mnt, mnt_flags);
+		if (mflags & MNT_READONLY_)
+			return 0;
+	}
+	union scratch *s = scratch();
+	if (!s)
+		return 0;
+	struct file_event *e = &s->file;
+	fill_header(&e->h, EV_FILE);
+	e->op = p->op;
+	e->dirfd = p->fd;
+	e->dirfd2 = AT_FDCWD_;
+	e->flags = p->flags;
+	e->mode = p->mode;
+	e->req_flags = 0;
+	e->ret = sc == SC_MMAP ? 0 : ret;
+	e->watched = 0;
+	e->path[0] = 0;
+	e->path2[0] = 0;
+	e->dir_off = PATHBUF;
+	e->dir2_off = PATHBUF;
+	struct path root = {}, pwd = {};
+	task_paths(task, &root, &pwd);
+	e->actual_off = resolve_file(e->actual, f, &root);
+	submit(e, sizeof(*e));
+	return 0;
+}
+
+#define EXIT_FD(name, id) SEC("tracepoint/syscalls/sys_exit_" #name) \
+	int tp_exit_##name(struct trace_event_raw_sys_exit *ctx) { return finish_fdop(id, ctx->ret); }
+
+EXIT_FD(fchmod, SC_FCHMOD)
+EXIT_FD(fchown, SC_FCHOWN)
+EXIT_FD(ftruncate, SC_FTRUNCATE)
+EXIT_FD(mmap, SC_MMAP)
+
+/* sendmsg that names a destination: same record as sendto. */
+ENTER(sendmsg)
+{
+	struct {
+		void *name;
+		int namelen;
+	} mh = {};
+	if (bpf_probe_read_user(&mh, sizeof(mh), (void *)ARG(1)) || !mh.name || mh.namelen <= 0)
+		return 0;
+	return stash_addr(SC_SENDTO, ARG(0), mh.name, mh.namelen);
+}
+EXIT(sendmsg, SC_SENDTO)
+
+/* ------------------------------------------------- third optional tier
+ *
+ * Extended attributes, device nodes, sendmmsg, and mprotect() turning a
+ * file mapping executable (the other way to load code without an exec).
+ */
+ENTER(setxattr)     { return stash_two(SC_SETXATTR, FOP_XATTR, AT_FDCWD_, (const char *)ARG(0),
+				       AT_FDCWD_, (const char *)ARG(1), 0); }
+ENTER(lsetxattr)    { return stash_two(SC_LSETXATTR, FOP_XATTR, AT_FDCWD_, (const char *)ARG(0),
+				       AT_FDCWD_, (const char *)ARG(1), 0); }
+ENTER(removexattr)  { return stash_two(SC_REMOVEXATTR, FOP_XATTR, AT_FDCWD_, (const char *)ARG(0),
+				       AT_FDCWD_, (const char *)ARG(1), 1); }
+ENTER(lremovexattr) { return stash_two(SC_LREMOVEXATTR, FOP_XATTR, AT_FDCWD_, (const char *)ARG(0),
+				       AT_FDCWD_, (const char *)ARG(1), 1); }
+/* By fd: the record has the file, not the attribute name. */
+ENTER(fsetxattr)    { return stash_fdop(SC_FSETXATTR, FOP_XATTR, ARG(0), 0, 0); }
+ENTER(fremovexattr) { return stash_fdop(SC_FREMOVEXATTR, FOP_XATTR, ARG(0), 1, 0); }
+EXIT(setxattr, SC_SETXATTR)
+EXIT(lsetxattr, SC_LSETXATTR)
+EXIT(removexattr, SC_REMOVEXATTR)
+EXIT(lremovexattr, SC_LREMOVEXATTR)
+EXIT_FD(fsetxattr, SC_FSETXATTR)
+EXIT_FD(fremovexattr, SC_FREMOVEXATTR)
+
+ENTER(mknod)   { return stash_path(SC_MKNOD, FOP_MKNOD, AT_FDCWD_, (const char *)ARG(0), ARG(2), ARG(1)); }
+ENTER(mknodat) { return stash_path(SC_MKNODAT, FOP_MKNOD, ARG(0), (const char *)ARG(1), ARG(3), ARG(2)); }
+EXIT(mknod, SC_MKNOD)
+EXIT(mknodat, SC_MKNODAT)
+
+/* The first message's destination stands for the batch. */
+ENTER(sendmmsg)
+{
+	struct {
+		void *name;
+		int namelen;
+	} mh = {};
+	if (bpf_probe_read_user(&mh, sizeof(mh), (void *)ARG(1)) || !mh.name || mh.namelen <= 0)
+		return 0;
+	return stash_addr(SC_SENDMMSG, ARG(0), mh.name, mh.namelen);
+}
+EXIT(sendmmsg, SC_SENDMMSG)
+
+/* mprotect(PROT_EXEC): the address is kept in flags (low) and mode (high). */
+ENTER(mprotect)
+{
+	if (!(ARG(2) & PROT_EXEC_))
+		return 0;
+	struct pending_op *p = begin(SC_MPROTECT, FOP_EXEC_MAP);
+	if (!p)
+		return 0;
+	p->flags = (__u32)ARG(0);
+	p->mode = (__u32)(ARG(0) >> 32);
+	return 0;
+}
+
+struct vma_ctx {
+	struct file *file;
+};
+
+static long vma_file_cb(struct task_struct *task, struct vm_area_struct *vma, void *data)
+{
+	struct vma_ctx *c = data;
+	c->file = vma->vm_file;
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_mprotect")
+int tp_exit_mprotect(struct trace_event_raw_sys_exit *ctx)
+{
+	if (ctx->ret != 0 || !in_sandbox())
+		return 0;
+	struct pending_op *p = tid_get(&op_store);
+	if (!p || !p->active || p->sc != SC_MPROTECT)
+		return 0;
+	p->active = 0;
+	struct task_struct *task = bpf_get_current_task_btf();
+	__u64 addr = p->flags | ((__u64)p->mode << 32);
+	struct vma_ctx c = {};
+	bpf_find_vma(task, addr, vma_file_cb, &c, 0);
+	/* Anonymous memory (every JIT does this) has no file: not a record. */
+	struct file *f = c.file;
+	if (!f)
+		return 0;
+	int mflags = BPF_CORE_READ(f, f_path.mnt, mnt_flags);
+	if (mflags & MNT_READONLY_)
+		return 0;
+	union scratch *s = scratch();
+	if (!s)
+		return 0;
+	struct file_event *e = &s->file;
+	fill_header(&e->h, EV_FILE);
+	e->op = FOP_EXEC_MAP;
+	e->dirfd = -1;
+	e->dirfd2 = AT_FDCWD_;
+	e->flags = 0;
+	e->mode = 1; /* via mprotect */
+	e->req_flags = 0;
+	e->ret = 0;
+	e->watched = 0;
+	e->path[0] = 0;
+	e->path2[0] = 0;
+	e->dir_off = PATHBUF;
+	e->dir2_off = PATHBUF;
+	struct path root = {}, pwd = {};
+	task_paths(task, &root, &pwd);
+	e->actual_off = resolve_file(e->actual, f, &root);
+	submit(e, sizeof(*e));
+	return 0;
+}
+
+/* ------------------------------------------------------ process lifecycle */
+
+/* One record per process, when its last thread exits. */
+SEC("tracepoint/sched/sched_process_exit")
+int tp_sched_process_exit(void *ctx)
+{
+	if (!in_sandbox())
+		return 0;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (BPF_CORE_READ(task, signal, live.counter) != 0)
+		return 0;
+	struct exit_event e = {};
+	fill_header(&e.h, EV_EXIT);
+	bpf_get_current_comm(e.comm, sizeof(e.comm));
+	e.exit_code = BPF_CORE_READ(task, exit_code);
+	e.start_boot_ns = BPF_CORE_READ(task, start_boottime);
+	submit(&e, sizeof(e));
+	return 0;
+}
+
+/* New processes (threads are skipped), so the tree has no gaps between
+ * execs. Runs in the parent. */
+SEC("raw_tracepoint/sched_process_fork")
+int rtp_sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!in_sandbox())
+		return 0;
+	struct task_struct *child = (struct task_struct *)ctx->args[1];
+	__u32 pid = BPF_CORE_READ(child, pid), tgid = BPF_CORE_READ(child, tgid);
+	if (pid != tgid)
+		return 0;
+	struct fork_event e = {};
+	fill_header(&e.h, EV_FORK);
+	e.child_pid = tgid;
+	struct pid *p = BPF_CORE_READ(child, thread_pid);
+	unsigned int level = BPF_CORE_READ(p, level);
+	struct upid up = {};
+	bpf_core_read(&up, sizeof(up), &p->numbers[level & 31]);
+	e.child_ns_pid = up.nr;
+	submit(&e, sizeof(e));
+	return 0;
+}
+
+/* Privileged syscalls (mount, ptrace, bpf, setuid, ...) that the sandbox
+ * refused: an agent probing its limits. Cheap for everything else: the
+ * return value is checked before anything is looked up. */
+SEC("tracepoint/raw_syscalls/sys_exit")
+int tp_sys_denied(struct trace_event_raw_sys_exit *ctx)
+{
+	long ret = ctx->ret;
+	if (ret != -1 /* EPERM */ && ret != -13 /* EACCES */ && ret != -38 /* ENOSYS */)
+		return 0;
+	if (!in_sandbox())
+		return 0;
+	__u32 nr = ctx->id;
+	if (!bpf_map_lookup_elem(&watch_sys, &nr))
+		return 0;
+	struct sys_denied_event e = {};
+	fill_header(&e.h, EV_SYS_DENIED);
+	bpf_get_current_comm(e.comm, sizeof(e.comm));
+	e.nr = nr;
+	e.ret = ret;
+	submit(&e, sizeof(e));
+	return 0;
+}
 
 /* ===================================================================== LSM
  *

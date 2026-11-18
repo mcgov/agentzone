@@ -28,6 +28,9 @@ enum event_kind {
 	EV_LSM_NET = 7,      /* LSM hook: connect/bind/sendto with kernel sockaddr    */
 	EV_OP_RESULT = 8,    /* syscall return for the LSM events just emitted        */
 	EV_EXEC_DENIED = 9,  /* bprm_check_security refused a --deny'd binary        */
+	EV_EXIT = 10,        /* sched_process_exit: a process (last thread) ended     */
+	EV_FORK = 11,        /* sched_process_fork: a new process (not thread)        */
+	EV_SYS_DENIED = 12,  /* a privileged syscall failed (EPERM/EACCES/ENOSYS)     */
 };
 
 /* --deny enforcement (rodata deny_mode) */
@@ -55,12 +58,21 @@ enum file_op {
 	FOP_CHMOD = 8,
 	FOP_CHOWN = 9,
 	FOP_TRUNCATE = 10,
+	FOP_EXEC_MAP = 11, /* mmap(PROT_EXEC) of a file on a writable mount; mode = 1
+			    * when it became executable through mprotect instead */
+	FOP_XATTR = 12,    /* path2 = attribute name; flags = 1 for remove      */
+	FOP_MKNOD = 13,    /* mode = type + permissions, flags = device number  */
 };
+
+#define DROP_KINDS 16 /* drop counters, indexed by event kind */
 
 enum net_op {
 	NOP_CONNECT = 1,
 	NOP_BIND = 2,
 	NOP_SENDTO = 3, /* sendmsg/sendto with an explicit destination */
+	NOP_LISTEN = 4,
+	NOP_ACCEPT = 5,
+	NOP_SENDMMSG = 6, /* like NOP_SENDTO, but ret counts messages, not bytes */
 };
 
 #define SYSCALL_NONE 0xffffffffu /* not in a syscall (io_uring worker thread)  */
@@ -133,7 +145,7 @@ struct file_event {
 	__u32 dir_off;       /* dir[]: what dirfd (or cwd) resolved to           */
 	__u32 dir2_off;      /* dir2[]: same for rename's new dirfd              */
 	__u32 actual_off;    /* actual[]: open only, path of the fd returned     */
-	__u32 _pad;
+	__u32 watched;       /* read-only open reported because of the watch list */
 	char path[PATHBUF];  /* requested path (old path for rename)             */
 	char path2[PATHBUF]; /* rename: requested new path                       */
 	char dir[PATH_ARR];
@@ -150,7 +162,8 @@ struct connect_event {
 	__u16 peer_family;   /* from the kernel socket after connect             */
 	__u16 peer_port;     /* network byte order                               */
 	__u32 sock_type;     /* SOCK_STREAM / SOCK_DGRAM / ...                    */
-	__u32 _pad;
+	__u16 op;            /* enum net_op (0 = connect)                        */
+	__u16 local_port;    /* socket's local port, host byte order             */
 	__u8 peer_addr[16];  /* v4 in first 4 bytes, or v6                       */
 	__u8 req_addr[SOCKADDR_MAX]; /* sockaddr as passed by the caller         */
 };
@@ -203,6 +216,28 @@ struct exec_denied_event {
 	__u32 exe_off;       /* exe[]: path of the refused file                  */
 	char name[NAME_MAX_ + 1]; /* its dentry name (what name rules match)     */
 	char exe[PATH_ARR];
+};
+
+struct exit_event {
+	struct ev_header h;
+	char comm[TASK_COMM_LEN];
+	__u32 exit_code;     /* wait status: (status << 8) | signal              */
+	__u32 _pad;
+	__u64 start_boot_ns; /* when the process started (boot clock)            */
+};
+
+struct fork_event {
+	struct ev_header h;  /* the parent                                       */
+	__u32 child_pid;     /* host tgid of the new process                     */
+	__u32 child_ns_pid;
+};
+
+struct sys_denied_event {
+	struct ev_header h;
+	char comm[TASK_COMM_LEN];
+	__u32 nr;            /* syscall number                                   */
+	__u32 _pad;
+	__s64 ret;
 };
 
 #endif

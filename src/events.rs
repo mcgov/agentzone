@@ -18,6 +18,15 @@ pub const EV_EXEC_RESULT: u32 = 3;
 pub const EV_FILE: u32 = 4;
 pub const EV_CONNECT: u32 = 5;
 pub const EV_EXEC_DENIED: u32 = 9;
+pub const EV_EXIT: u32 = 10;
+pub const EV_FORK: u32 = 11;
+pub const EV_SYS_DENIED: u32 = 12;
+
+pub const NOP_BIND: u16 = 2;
+pub const NOP_SENDTO: u16 = 3;
+pub const NOP_LISTEN: u16 = 4;
+pub const NOP_ACCEPT: u16 = 5;
+pub const NOP_SENDMMSG: u16 = 6;
 
 pub const DENY_OFF: u32 = 0;
 pub const DENY_LSM: u32 = 1;
@@ -30,6 +39,31 @@ pub const FOP_UNLINK: u32 = 2;
 pub const FOP_RMDIR: u32 = 3;
 pub const FOP_RENAME: u32 = 4;
 pub const FOP_MKDIR: u32 = 5;
+pub const FOP_LINK: u32 = 6;
+pub const FOP_SYMLINK: u32 = 7;
+pub const FOP_CHMOD: u32 = 8;
+pub const FOP_CHOWN: u32 = 9;
+pub const FOP_TRUNCATE: u32 = 10;
+pub const FOP_EXEC_MAP: u32 = 11;
+pub const FOP_XATTR: u32 = 12;
+pub const FOP_MKNOD: u32 = 13;
+pub const DROP_KINDS: u32 = 16;
+
+/// Record type an event kind turns into (for naming dropped events).
+pub fn kind_name(kind: u32) -> &'static str {
+    match kind {
+        EV_EXEC_REQUEST => "exec_request",
+        EV_EXEC => "exec",
+        EV_EXEC_RESULT => "exec_failed",
+        EV_FILE => "file",
+        EV_CONNECT => "socket",
+        EV_EXEC_DENIED => "exec_denied",
+        EV_EXIT => "exit",
+        EV_FORK => "fork",
+        EV_SYS_DENIED => "sys_denied",
+        _ => "other",
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -101,7 +135,7 @@ pub struct FileEvent {
     pub dir_off: u32,
     pub dir2_off: u32,
     pub actual_off: u32,
-    pub _pad: u32,
+    pub watched: u32,
     pub path: [u8; PATHBUF],
     pub path2: [u8; PATHBUF],
     pub dir: [u8; PATH_ARR],
@@ -120,7 +154,8 @@ pub struct ConnectEvent {
     pub peer_family: u16,
     pub peer_port: u16, // network byte order
     pub sock_type: u32,
-    pub _pad: u32,
+    pub op: u16,
+    pub local_port: u16,
     pub peer_addr: [u8; 16],
     pub req_addr: [u8; 128],
 }
@@ -140,6 +175,34 @@ pub struct ExecDenied {
 pub struct DenyInoKey {
     pub dev: u64,
     pub ino: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExitEvent {
+    pub h: Header,
+    pub comm: [u8; 16],
+    pub exit_code: u32,
+    pub _pad: u32,
+    pub start_boot_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ForkEvent {
+    pub h: Header,
+    pub child_pid: u32,
+    pub child_ns_pid: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SysDenied {
+    pub h: Header,
+    pub comm: [u8; 16],
+    pub nr: u32,
+    pub _pad: u32,
+    pub ret: i64,
 }
 
 // Values printed by compiling events.h with gcc (see README).
@@ -171,6 +234,12 @@ const _: () = {
     assert!(size_of::<ExecDenied>() == 4672);
     assert!(offset_of!(ExecDenied, name) == 64);
     assert!(offset_of!(ExecDenied, exe) == 320);
+    assert!(offset_of!(ConnectEvent, op) == 68);
+    assert!(offset_of!(ConnectEvent, local_port) == 70);
+    assert!(offset_of!(FileEvent, watched) == 84);
+    assert!(size_of::<ExitEvent>() == 72);
+    assert!(size_of::<ForkEvent>() == 48);
+    assert!(size_of::<SysDenied>() == 72);
 };
 
 pub enum Event {
@@ -180,6 +249,9 @@ pub enum Event {
     File(Box<FileEvent>),
     Connect(ConnectEvent),
     Denied(Box<ExecDenied>),
+    Exit(ExitEvent),
+    Fork(ForkEvent),
+    SysDenied(SysDenied),
 }
 
 fn read_boxed<T>(data: &[u8]) -> Option<Box<T>> {
@@ -210,6 +282,9 @@ pub fn decode(data: &[u8]) -> Option<Event> {
         EV_FILE => read_boxed::<FileEvent>(data).map(Event::File),
         EV_CONNECT => read_boxed::<ConnectEvent>(data).map(|b| Event::Connect(*b)),
         EV_EXEC_DENIED => read_boxed::<ExecDenied>(data).map(Event::Denied),
+        EV_EXIT => read_boxed::<ExitEvent>(data).map(|b| Event::Exit(*b)),
+        EV_FORK => read_boxed::<ForkEvent>(data).map(|b| Event::Fork(*b)),
+        EV_SYS_DENIED => read_boxed::<SysDenied>(data).map(|b| Event::SysDenied(*b)),
         _ => None,
     }
 }

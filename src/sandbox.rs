@@ -62,6 +62,10 @@ pub struct Config {
     pub proxy: bool,
     /// Host dir with the proxy CA files, mounted read-only at TRUST_DIR.
     pub trust_dir: Option<PathBuf>,
+    /// Make io_uring_setup fail (ENOSYS) for the agent. io_uring operations
+    /// bypass the syscall hooks, so with it available file and network
+    /// activity can go unlogged.
+    pub block_io_uring: bool,
 }
 
 /// Where the proxy's CA files appear inside the sandbox.
@@ -397,6 +401,7 @@ fn init(cfg: &Config, argv: &[CString], env: &[CString]) -> Result<i32> {
     }
     let _ = sethostname(&cfg.hostname);
     build_root(cfg)?;
+    canary();
 
     let agent = match unsafe { fork() }? {
         ForkResult::Child => {
@@ -422,6 +427,93 @@ fn init(cfg: &Config, argv: &[CString], env: &[CString]) -> Result<i32> {
     }
 }
 
+/// Self-test for the tracer. Before the agent starts, a throwaway child
+/// (always pid 2 in the sandbox) does one of each thing the hooks are
+/// supposed to see: a write-open, a connect, and an exec (of a path that
+/// doesn't exist, so it fails). The logger looks for those events and warns
+/// if a kind is missing; they never appear in the log themselves. Without
+/// this, a hook that silently stopped working just looks like a quiet agent.
+fn canary() {
+    use crate::log::{CANARY_EXEC, CANARY_FILE};
+    let (Ok(file), Ok(exe)) = (CString::new(CANARY_FILE), CString::new(CANARY_EXEC)) else { return };
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => unsafe {
+            let fd = libc::open(file.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+            if fd >= 0 {
+                libc::close(fd);
+            }
+            libc::unlink(file.as_ptr());
+            // 127.0.0.1:1 (log::CANARY_ADDR); refused, which is fine.
+            let s = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if s >= 0 {
+                let mut a: libc::sockaddr_in = std::mem::zeroed();
+                a.sin_family = libc::AF_INET as libc::sa_family_t;
+                a.sin_port = 1u16.to_be();
+                a.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+                libc::connect(s, &a as *const _ as *const libc::sockaddr, std::mem::size_of_val(&a) as u32);
+                libc::close(s);
+            }
+            let argv = [exe.as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null::<libc::c_char>()];
+            libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::_exit(0)
+        },
+        Ok(ForkResult::Parent { child }) => {
+            let _ = waitpid(child, None);
+        }
+        Err(_) => {}
+    }
+}
+
+/// seccomp filter: io_uring_setup returns ENOSYS (what a kernel without
+/// io_uring says, so runtimes take their fallback path). The syscall number
+/// is 425 on every architecture; the second test is its x32 alias.
+fn block_io_uring() -> Result<()> {
+    const LD_NR: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    const JEQ: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const RET: u16 = 0x06; // BPF_RET | BPF_K
+    const X32: u32 = 0x4000_0000;
+    let nr = libc::SYS_io_uring_setup as u32;
+    let f = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+    let filter = [
+        f(LD_NR, 0, 0, 0), // seccomp_data.nr
+        f(JEQ, 1, 0, nr),
+        f(JEQ, 0, 1, nr | X32),
+        f(RET, 0, 0, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+        f(RET, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ];
+    let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
+    let r = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog as *const libc::sock_fprog) };
+    if r != 0 {
+        bail!("PR_SET_SECCOMP: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_uring_is_refused_after_filter() {
+        // In a child: the filter is irreversible.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let ok = block_io_uring().is_ok();
+                let r = libc::syscall(libc::SYS_io_uring_setup, 4, std::ptr::null_mut::<u8>());
+                let refused = r == -1 && *libc::__errno_location() == libc::ENOSYS;
+                // Other syscalls still work.
+                let alive = libc::getpid() > 0;
+                libc::_exit(if ok && refused && alive { 0 } else { 1 })
+            },
+            ForkResult::Parent { child } => {
+                assert_eq!(exit_code(waitpid(child, None).unwrap()), Some(0));
+            }
+        }
+    }
+}
+
 fn exec_agent(cfg: &Config, argv: &[CString], env: &[CString]) -> anyhow::Error {
     let r: Result<std::convert::Infallible> = (|| {
         let (uid, gid) = (Uid::from_raw(cfg.uid), Gid::from_raw(cfg.gid));
@@ -431,6 +523,9 @@ fn exec_agent(cfg: &Config, argv: &[CString], env: &[CString]) -> anyhow::Error 
         // setuid binaries (sudo, su, ...) can no longer raise privileges.
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             bail!("PR_SET_NO_NEW_PRIVS: {}", std::io::Error::last_os_error());
+        }
+        if cfg.block_io_uring {
+            block_io_uring().context("installing the io_uring seccomp filter")?;
         }
         chdir(&cfg.mount_at).with_context(|| format!("chdir {}", cfg.mount_at.display()))?;
         nix::unistd::execvpe(&argv[0], argv, env)

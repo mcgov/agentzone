@@ -148,6 +148,93 @@ rewritten mid-call), `failed` (connect failed, nothing to compare), `no_peer`
 (e.g. unix sockets) or `unknown` (unreadable request). Unix sockets show their
 path, or `@name` for abstract ones.
 
+### Is the tracer actually working? The self-test
+
+A hook that silently stops delivering events looks exactly like an agent that
+did nothing. So before the agent starts, the sandbox's init runs a throwaway
+child that does one of each: a write-open, a connect, a fork, an exec (of a
+path that doesn't exist), and an exit. The logger looks for those events,
+keeps them out of the log, and reports the outcome:
+
+```json
+{"type":"summary", ..., "self_test":{"exec_request":true,"exec_result":true,"file":true,
+ "connect":true,"fork":true,"exit":true},"optional_hooks":true}
+```
+
+If a kind is missing, agentbox prints a `WARNING: self-test failed` line when
+the agent starts, naming the record types the log won't have.
+
+`optional_hooks` is how many optional tiers of hooks loaded, on top of the
+core set (exec, open/unlink/rename/mkdir, connect):
+
+| tier | adds |
+|---|---|
+| 1 | `fork`/`exit`, `sys_denied`, `bind`/`listen`/`accept`/`sendto`, link/symlink/chmod/chown/truncate, watched reads |
+| 2 | `fchmod`/`fchown`/`ftruncate`, `exec_map`, `sendmsg` |
+| 3 | xattrs, `mknod`, `sendmmsg`, `exec_map` via `mprotect` |
+ A kernel
+that rejects a tier gets the one below and a warning saying what's missing.
+
+If the ring buffer overflows, `dropped_by_type` in the summary (and a warning)
+says which record types have holes, e.g. `{"file": 212, "exec_request": 3}`.
+
+### Process lifecycle, sockets, and refused privileges
+
+```json
+{"type":"fork","pid":7314,"child_pid":7315,"child_sandbox_pid":9, ...}
+{"type":"exit","pid":7315,"comm":"curl","exit_status":0,"duration_ms":212, ...}
+{"type":"exit","pid":7320,"comm":"sleep","signal":9,"duration_ms":30004, ...}
+{"type":"bind","fd":3,"family":"inet","socket":"stream","address":"0.0.0.0:8000","local_port":8000, ...}
+{"type":"listen","fd":3,"socket":"stream","local_port":8000, ...}
+{"type":"accept","fd":3,"new_fd":4,"peer":"127.0.0.1:51234","local_port":8000, ...}
+{"type":"sendto","fd":5,"family":"inet","socket":"dgram","address":"8.8.8.8:53","bytes":40, ...}
+{"type":"sys_denied","comm":"sudo","syscall":"setresuid","errno":1,"error":"Operation not permitted", ...}
+```
+
+- `fork` is processes only (threads are skipped); `exit` is one record per
+  process, when its last thread goes.
+- `sendto` is logged only when it names a destination (unconnected UDP).
+- `sys_denied`: a privileged syscall (mount, unshare, setns, ptrace, bpf,
+  keyctl, module loading, set*uid, ... see `src/watch.rs`) that failed with
+  `EPERM`, `EACCES` or `ENOSYS`: an agent testing its limits.
+- `connect` records carry `local_port`, and the proxy's `http`,
+  `http_request` and `http_tunnel` records carry the same number as
+  `client_port`, so a request can be joined to the kernel's view of the socket.
+- File records gained `link`, `symlink` (`link_target`), `chmod` (`mode`),
+  `chown` (`new_uid`/`new_gid`) and `truncate` (`length`). The fd-based
+  `fchmod`/`fchown`/`ftruncate` produce the same records with `fd` instead of
+  `path`; `target` is the file the kernel resolved the descriptor to.
+- `sendmsg` with a destination is logged as `sendto`; so is `sendmmsg`, with
+  `messages` (how many were sent) and the first message's destination.
+- `setxattr`/`removexattr` records carry `attr` (the fd-based variants only
+  the file), and `mknod` records the `node` type, `mode` and `device`.
+- `exec_map`: a file mapped executable (`dlopen`, `LD_PRELOAD`, native
+  extensions) from a *writable* mount: the project, `$HOME`, `/tmp`. That is
+  code loaded without an exec, from somewhere the agent could have put it.
+  Mappings from the read-only system directories aren't logged (every exec
+  maps a dozen of those). `"via": "mprotect"` means an existing mapping of
+  the file was made executable afterwards.
+
+```json
+{"type":"exec_map","pid":7402,"path":"/tmp/hook.so","fd":3, ...}
+```
+
+### Watched reads
+
+Read-only opens are only logged with `--log-reads`, which is a lot. But
+`--home-from ~` puts real credentials in front of the agent, so reads of a
+watch list are always logged, marked `"watched": true`:
+
+`~/.ssh ~/.aws ~/.azure ~/.gnupg ~/.kube ~/.netrc ~/.npmrc ~/.pypirc
+~/.git-credentials ~/.password-store ~/.config/gh ~/.config/gcloud
+~/.config/op ~/.docker/config.json ~/.local/share/keyrings
+~/.claude/.credentials.json`, and any file named `.env`.
+
+`--watch-read PATH|NAME` adds a path (a directory covers everything under it)
+or a bare file name; `--no-default-watch` drops the built-in list. Matching is
+on the path the kernel resolved, so a symlink into `~/.ssh` is caught.
+`summary.watched_opens` counts them.
+
 ### HTTP(S) traffic: `--log-http`
 
 ```
@@ -195,6 +282,9 @@ produces one record per exchange:
   `*secret*`, `*-key`) are redacted; `--http-log-secrets` keeps them.
 - `http_tunnel` records show each CONNECT: target, upstream address, and
   errors such as a client that refused the CA.
+- An `http_request` record (no bodies) is written as soon as a request has
+  been sent, so there's a trace even if the response never completes. The
+  full `http` record follows; `conn` + `seq` tie the two together.
 
 `--http-pcap [FILE]` also writes the decrypted traffic to a classic libpcap
 file (default `<state>/http.pcap`). The proxy handles sockets, not packets, so
@@ -214,6 +304,11 @@ redacted, so it holds whatever credentials were sent. It's created with mode
 
 `agentbox proxy --listen 127.0.0.1:3128 --dir DIR` runs the same proxy without
 a sandbox or root and prints the variables to export.
+
+WebSocket connections are followed after the `101`: each message is a `ws`
+record with `direction` (`sent` by the agent / `received`), `opcode`, wire
+`bytes`, and `data` (JSON when it parses, else text, else `data_base64`).
+Fragments are reassembled and permessage-deflate is inflated.
 
 Limits: only HTTP/1.1 is parsed, and the proxy offers only `http/1.1` over
 ALPN. A client that pins certificates, or keeps its own trust store and
@@ -300,6 +395,9 @@ src/sandbox.rs       cgroup, namespaces, overlay + read-only root, pivot_root, p
 src/proxy.rs         --log-http: CA, CONNECT/TLS interception, relay, process attribution
 src/http.rs          passive HTTP/1.1 parser, body decoding, header redaction
 src/deny.rs          --deny rule resolution (names, paths -> superblock dev + inode)
+src/watch.rs         watched-read list, privileged syscall list
+src/ws.rs            WebSocket frames -> messages (fragments, permessage-deflate)
+src/pcap.rs          --http-pcap: synthesized TCP streams of the decrypted traffic
 src/diff.rs          reads the overlay upper layer
 ```
 
@@ -316,14 +414,15 @@ filesystem view and reaps children) → agent (drops privileges and execs).
   `--log-http` allows only proxied HTTP(S). There's no per-host egress policy yet.
 - **Environment is inherited** from the caller (minus `HOME`/`PWD`/`TMPDIR`),
   secrets included. Wrap with `env -i` or add an allowlist.
-- **io_uring bypasses syscall hooks.** File and network operations submitted
-  through io_uring don't pass through these tracepoints. The overlay still
-  contains every write, but the per-process records won't. Either disable it
-  host-wide (`sysctl kernel.io_uring_disabled=2`) or block `io_uring_setup` in
-  the sandbox with seccomp (not done yet).
-- **Not every syscall is covered.** Missing so far: `link`/`symlink`,
-  `chmod`/`chown`, `truncate`, `bind`/`listen`, and UDP `sendto`/`sendmsg`
-  without a prior `connect`. All follow the same enter/exit pattern.
+- **io_uring is turned off for the agent.** io_uring I/O doesn't pass through
+  the syscall hooks, so a seccomp filter makes `io_uring_setup` fail with
+  `ENOSYS` (runtimes fall back to ordinary syscalls). `--allow-io-uring`
+  removes the filter, and with it the guarantee that file and network
+  operations are logged.
+- **Not every syscall is covered.** The file, socket and process hooks now
+  cover the calls listed above; what a process does with memory it already
+  has (writing code into an anonymous mapping, as every JIT does) is not
+  visible, and neither are `ioctl`s.
 - **Connect sees IPs, not hostnames.** DNS isn't decoded, and with a proxy
   every connection goes to the proxy.
 - **Abstract unix sockets** (`@name`) are scoped by *network* namespace, so

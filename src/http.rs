@@ -100,6 +100,12 @@ impl Parser {
         self.buf = Vec::new();
     }
 
+    /// Bytes received after the point where parsing stopped (the first
+    /// frames of an upgraded connection can arrive with the 101 itself).
+    pub fn take_rest(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
     pub fn feed(&mut self, data: &[u8], sink: &mut impl Sink) {
         match self.st {
             St::Dead => return,
